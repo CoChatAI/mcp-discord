@@ -28,6 +28,14 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 if not DISCORD_TOKEN:
     raise ValueError("DISCORD_TOKEN environment variable is required")
 
+# User context from headers (passed through proxy)
+# These identify the user making requests - validated via Discord API before each operation
+DISCORD_USER_ID = os.getenv("DISCORD_USER_ID")
+DISCORD_SERVER_ID = os.getenv("DISCORD_SERVER_ID")  # Optional: pre-selected server
+
+if not DISCORD_USER_ID:
+    raise ValueError("DISCORD_USER_ID environment variable is required - user must authenticate via OAuth")
+
 # Initialize Discord bot with necessary intents
 intents = discord.Intents.default()
 intents.message_content = True
@@ -45,6 +53,7 @@ async def on_ready():
     global discord_client
     discord_client = bot
     logger.info(f"Logged in as {bot.user.name}")
+    logger.info(f"User context: Discord user {DISCORD_USER_ID}, selected server: {DISCORD_SERVER_ID or 'none'}")
 
 # Helper function to ensure Discord client is ready
 def require_discord_client(func):
@@ -54,6 +63,63 @@ def require_discord_client(func):
             raise RuntimeError("Discord client not ready")
         return await func(*args, **kwargs)
     return wrapper
+
+
+async def validate_user_in_guild(user_id: str, guild_id: str) -> discord.Member:
+    """
+    Validate that a user is a member of the specified guild.
+
+    This is the core security check - headers only identify the user,
+    but we VERIFY membership via Discord's API. This prevents users
+    from spoofing headers to access servers they don't belong to.
+
+    Args:
+        user_id: Discord user ID (from DISCORD_USER_ID env var)
+        guild_id: Discord guild/server ID to validate against
+
+    Returns:
+        The Member object if validation succeeds
+
+    Raises:
+        ValueError: If bot isn't in the server or user isn't a member
+    """
+    if not discord_client:
+        raise RuntimeError("Discord client not ready")
+
+    # First check if bot is in the guild
+    guild = discord_client.get_guild(int(guild_id))
+    if not guild:
+        logger.warning(f"Membership validation failed: bot not in guild {guild_id}")
+        raise ValueError(f"Bot is not in server {guild_id}")
+
+    # Now verify user is actually a member - this calls Discord API
+    try:
+        member = await guild.fetch_member(int(user_id))
+        if not member:
+            logger.warning(f"Membership validation failed: user {user_id} not in guild {guild_id}")
+            raise ValueError("You are not a member of this server")
+        logger.debug(f"Membership validated: user {user_id} in guild {guild.name} ({guild_id})")
+        return member
+    except discord.NotFound:
+        logger.warning(f"Membership validation failed: user {user_id} not found in guild {guild_id}")
+        raise ValueError("You are not a member of this server")
+    except discord.Forbidden:
+        logger.error(f"Membership validation failed: bot lacks permissions in guild {guild_id}")
+        raise ValueError("Cannot verify membership - bot lacks permissions")
+
+
+async def get_guild_id_from_channel(channel_id: str) -> str:
+    """Get the guild ID that a channel belongs to."""
+    channel = await discord_client.fetch_channel(int(channel_id))
+    if not hasattr(channel, 'guild') or not channel.guild:
+        raise ValueError("This channel is not part of a server (possibly a DM)")
+    return str(channel.guild.id)
+
+
+async def validate_user_for_channel(user_id: str, channel_id: str) -> None:
+    """Validate that user has access to the channel's guild."""
+    guild_id = await get_guild_id_from_channel(channel_id)
+    await validate_user_in_guild(user_id, guild_id)
 
 @app.list_tools()
 async def list_tools() -> List[Tool]:
@@ -354,7 +420,7 @@ async def list_tools() -> List[Tool]:
         ),
         Tool(
             name="list_servers",
-            description="Get a list of all Discord servers the bot has access to with their details such as name, id, member count, and creation date.",
+            description="Get a list of Discord servers where both you and the CoChat bot are members. Returns server details including name, id, member count, and creation date.",
             inputSchema={
                 "type": "object",
                 "properties": {},
@@ -366,8 +432,41 @@ async def list_tools() -> List[Tool]:
 @app.call_tool()
 @require_discord_client
 async def call_tool(name: str, arguments: Any) -> List[TextContent]:
-    """Handle Discord tool calls."""
-    
+    """Handle Discord tool calls with user membership validation."""
+
+    logger.info(f"Tool call: {name} by user {DISCORD_USER_ID}")
+
+    # Determine which guild to validate against based on the tool
+    # Tools that use server_id directly
+    server_id_tools = {
+        "get_server_info", "get_channels", "list_members",
+        "add_role", "remove_role", "create_text_channel"
+    }
+    # Tools that use channel_id (need to look up the guild)
+    channel_id_tools = {
+        "send_message", "read_messages", "delete_channel",
+        "add_reaction", "add_multiple_reactions", "remove_reaction",
+        "moderate_message"
+    }
+
+    # Validate user membership before executing the tool
+    if name in server_id_tools:
+        server_id = arguments.get("server_id")
+        if not server_id:
+            raise ValueError(f"server_id is required for {name}")
+        logger.info(f"Validating user {DISCORD_USER_ID} access to server {server_id}")
+        await validate_user_in_guild(DISCORD_USER_ID, server_id)
+
+    elif name in channel_id_tools:
+        channel_id = arguments.get("channel_id")
+        if not channel_id:
+            raise ValueError(f"channel_id is required for {name}")
+        logger.info(f"Validating user {DISCORD_USER_ID} access to channel {channel_id}")
+        await validate_user_for_channel(DISCORD_USER_ID, channel_id)
+
+    # get_user_info doesn't require guild validation (can look up any user)
+    # list_servers has special handling below (filters to user's servers)
+
     if name == "send_message":
         channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
         message = await channel.send(arguments["content"])
@@ -592,18 +691,26 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
         )]
 
     elif name == "list_servers":
+        # Only return servers where BOTH the bot AND the user are members
         servers = []
         for guild in discord_client.guilds:
-            servers.append({
-                "id": str(guild.id),
-                "name": guild.name,
-                "member_count": guild.member_count,
-                "created_at": guild.created_at.isoformat()
-            })
-        
+            # Verify user is actually a member of this guild
+            try:
+                member = await guild.fetch_member(int(DISCORD_USER_ID))
+                if member:
+                    servers.append({
+                        "id": str(guild.id),
+                        "name": guild.name,
+                        "member_count": guild.member_count,
+                        "created_at": guild.created_at.isoformat()
+                    })
+            except (discord.NotFound, discord.Forbidden):
+                # User not in this guild or can't check - skip it
+                continue
+
         return [TextContent(
             type="text",
-            text=f"Available Servers ({len(servers)}):\n" + 
+            text=f"Available Servers ({len(servers)}):\n" +
                  "\n".join(f"{s['name']} (ID: {s['id']}, Members: {s['member_count']})" for s in servers)
         )]
 

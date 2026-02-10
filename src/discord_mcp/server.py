@@ -59,8 +59,13 @@ async def on_ready():
 def require_discord_client(func):
     @wraps(func)
     async def wrapper(*args, **kwargs):
+        # Wait up to 30 seconds for the Discord bot to connect
+        for _ in range(60):
+            if discord_client:
+                break
+            await asyncio.sleep(0.5)
         if not discord_client:
-            raise RuntimeError("Discord client not ready")
+            raise RuntimeError("Discord client not ready after 30s - check DISCORD_TOKEN")
         return await func(*args, **kwargs)
     return wrapper
 
